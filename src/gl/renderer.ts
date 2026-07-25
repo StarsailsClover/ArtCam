@@ -41,14 +41,77 @@ function buildEffectFragment(effect: ArtEffect): string {
 }
 
 /**
+ * Build a small synthetic scene (video + mask) for gallery thumbnails, so
+ * effects have something to transform even when the camera is off. The scene
+ * is intentionally abstract (a soft "head" oval over a gradient) — it is a
+ * test pattern, not a fake photo.
+ */
+function buildThumbnailScene(): { video: HTMLCanvasElement; mask: HTMLCanvasElement } {
+  const w = 256
+  const h = 256
+  const video = document.createElement('canvas')
+  video.width = w
+  video.height = h
+  const vctx = video.getContext('2d')!
+  // Vertical gradient background.
+  const grad = vctx.createLinearGradient(0, 0, 0, h)
+  grad.addColorStop(0, '#2a2438')
+  grad.addColorStop(1, '#0d1117')
+  vctx.fillStyle = grad
+  vctx.fillRect(0, 0, w, h)
+  // Soft "head" oval in the center with skin-ish tone.
+  const headGrad = vctx.createRadialGradient(w / 2, h * 0.42, 10, w / 2, h * 0.42, h * 0.4)
+  headGrad.addColorStop(0, '#f3d2b3')
+  headGrad.addColorStop(0.6, '#b88a6a')
+  headGrad.addColorStop(1, 'rgba(60,40,30,0)')
+  vctx.fillStyle = headGrad
+  vctx.beginPath()
+  vctx.ellipse(w / 2, h * 0.42, w * 0.22, h * 0.3, 0, 0, Math.PI * 2)
+  vctx.fill()
+  // Shoulders.
+  vctx.fillStyle = 'rgba(80,90,120,0.85)'
+  vctx.beginPath()
+  vctx.ellipse(w / 2, h * 0.95, w * 0.45, h * 0.18, 0, 0, Math.PI * 2)
+  vctx.fill()
+  // Sparse noise so brightness-based effects have variation.
+  const img = vctx.getImageData(0, 0, w, h)
+  for (let i = 0; i < img.data.length; i += 4) {
+    const n = (Math.random() - 0.5) * 18
+    img.data[i] = Math.max(0, Math.min(255, img.data[i] + n))
+    img.data[i + 1] = Math.max(0, Math.min(255, img.data[i + 1] + n))
+    img.data[i + 2] = Math.max(0, Math.min(255, img.data[i + 2] + n))
+  }
+  vctx.putImageData(img, 0, 0)
+
+  const mask = document.createElement('canvas')
+  mask.width = w
+  mask.height = h
+  const mctx = mask.getContext('2d')!
+  mctx.fillStyle = '#000'
+  mctx.fillRect(0, 0, w, h)
+  // Person mask = head + shoulders (white = person).
+  mctx.fillStyle = '#fff'
+  mctx.beginPath()
+  mctx.ellipse(w / 2, h * 0.42, w * 0.22, h * 0.3, 0, 0, Math.PI * 2)
+  mctx.fill()
+  mctx.beginPath()
+  mctx.ellipse(w / 2, h * 0.95, w * 0.45, h * 0.18, 0, 0, Math.PI * 2)
+  mctx.fill()
+
+  return { video, mask }
+}
+
+/**
  * WebGL2 renderer that maintains:
  *   - a persistent art FBO (the cumulative placed rectangles)
  *   - a video texture (uploaded each frame)
+ *   - a person-segmentation mask texture (uploaded each frame)
  *   - a composite shader that mixes video + art for display
  *
  * Rendering pipeline per frame:
  *   1. uploadVideoFrame(video)            — refresh camera texture
- *   2. renderComposite(mirror)            — clear art FBO, redraw ALL placed
+ *   2. uploadMaskFrame(maskSource)        — refresh person mask texture
+ *   3. renderComposite(mirror)            — clear art FBO, redraw ALL placed
  *      rects (each animated by `time`), then composite video + art to screen.
  *
  * Re-rendering every rect every frame is intentional: it keeps every placed
@@ -59,6 +122,7 @@ export class ArtRenderer {
   private gl: WebGL2RenderingContext
   private canvas: HTMLCanvasElement
   private videoTexture: WebGLTexture
+  private maskTexture: WebGLTexture
   private artTexture: WebGLTexture
   private artFBO: WebGLFramebuffer
   private quadVBO: WebGLBuffer
@@ -68,6 +132,10 @@ export class ArtRenderer {
   private width = 0
   private height = 0
   private startTime = performance.now()
+  // Synthetic scene for gallery thumbnails (lazily built).
+  private thumbScene: { video: HTMLCanvasElement; mask: HTMLCanvasElement } | null = null
+  // Whether a real video frame has been uploaded yet. Controls thumbnail source.
+  private hasRealVideo = false
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas
@@ -80,7 +148,7 @@ export class ArtRenderer {
     if (!gl) throw new Error('WebGL2 is not supported by this browser.')
     this.gl = gl
 
-    // Flip Y when uploading video so the texture matches canvas orientation.
+    // Flip Y when uploading video/mask so the texture matches canvas orientation.
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true)
 
     // Fullscreen / rect quad (two triangles covering [-1,1]×[-1,1]).
@@ -94,17 +162,21 @@ export class ArtRenderer {
       gl.STATIC_DRAW,
     )
 
-    // Video texture (initially a 1×1 placeholder; algorithms don't sample it
-    // but the uniform must still bind to a valid texture).
+    // Video texture (initially a 1×1 dark placeholder).
     this.videoTexture = gl.createTexture()!
-    gl.bindTexture(gl.TEXTURE_2D, this.videoTexture)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    this.bindTextureParams(this.videoTexture)
     gl.texImage2D(
       gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
       new Uint8Array([16, 16, 20, 255]),
+    )
+
+    // Mask texture (initially all-person = 255, so segmentation effects
+    // gracefully treat everything as foreground before the first real mask).
+    this.maskTexture = gl.createTexture()!
+    this.bindTextureParams(this.maskTexture)
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+      new Uint8Array([255, 255, 255, 255]),
     )
 
     // Composite program.
@@ -117,6 +189,15 @@ export class ArtRenderer {
     this.resize(canvas.width || 1280, canvas.height || 720)
   }
 
+  private bindTextureParams(tex: WebGLTexture) {
+    const gl = this.gl
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  }
+
   resize(width: number, height: number) {
     if (width === this.width && height === this.height) return
     this.width = width
@@ -126,11 +207,7 @@ export class ArtRenderer {
     this.canvas.height = height
 
     // Reallocate art texture.
-    gl.bindTexture(gl.TEXTURE_2D, this.artTexture)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    this.bindTextureParams(this.artTexture)
     gl.texImage2D(
       gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null,
     )
@@ -145,6 +222,14 @@ export class ArtRenderer {
     const gl = this.gl
     gl.bindTexture(gl.TEXTURE_2D, this.videoTexture)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video)
+    this.hasRealVideo = true
+  }
+
+  /** Upload the person-segmentation mask. Source can be a canvas or video. */
+  uploadMaskFrame(source: HTMLCanvasElement | HTMLVideoElement | ImageBitmap) {
+    const gl = this.gl
+    gl.bindTexture(gl.TEXTURE_2D, this.maskTexture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source)
   }
 
   private getEffectProgram(effectId: number): WebGLProgram {
@@ -179,7 +264,12 @@ export class ArtRenderer {
     const y1 = Math.min(rect.y1, rect.y2)
     const y2 = Math.max(rect.y1, rect.y2)
     const originX = x1
-    const originY = y1
+    // MediaPipe landmarks use top-down Y (0=top of image). The video texture
+    // is uploaded with UNPACK_FLIP_Y_WEBGL=true so texture v=0 maps to the
+    // bottom of the source image. To place the rect at the correct screen
+    // position AND sample the correct video region, flip Y: the rect's bottom
+    // (in screen space) corresponds to the larger MediaPipe Y.
+    const originY = 1 - y2
     const sizeX = Math.max(0.001, x2 - x1)
     const sizeY = Math.max(0.001, y2 - y1)
 
@@ -191,11 +281,14 @@ export class ArtRenderer {
     // palette is a vec3[8] -> upload as flattened float[24].
     gl.uniform3fv(gl.getUniformLocation(program, 'palette'), rect.palette)
 
-    // Effect algorithms don't sample uVideo, but the uniform must still be
-    // bound to a valid texture unit. Bind the video texture (cheap).
+    // uVideo -> texture unit 0
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, this.videoTexture)
     gl.uniform1i(gl.getUniformLocation(program, 'uVideo'), 0)
+    // uMask -> texture unit 1
+    gl.activeTexture(gl.TEXTURE1)
+    gl.bindTexture(gl.TEXTURE_2D, this.maskTexture)
+    gl.uniform1i(gl.getUniformLocation(program, 'uMask'), 1)
 
     this.drawQuad()
   }
@@ -266,6 +359,28 @@ export class ArtRenderer {
     // Save current state.
     const prevFBO = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null
     const prevViewport = gl.getParameter(gl.VIEWPORT) as Int32Array
+    const prevActiveTex = gl.getParameter(gl.ACTIVE_TEXTURE) as number
+
+    // For thumbnails, use the real video frame if available; otherwise use
+    // a synthetic test-pattern scene so effects have something to transform.
+    let thumbVideo: HTMLVideoElement | HTMLCanvasElement | null = null
+    let thumbMask: HTMLCanvasElement | null = null
+    if (this.hasRealVideo) {
+      // Real video: use the current videoTexture (already bound). Mask: use
+      // the current maskTexture (already bound) — it may be the all-ones
+      // placeholder if segmentation isn't running, which is fine.
+    } else {
+      if (!this.thumbScene) this.thumbScene = buildThumbnailScene()
+      thumbVideo = this.thumbScene.video
+      thumbMask = this.thumbScene.mask
+      // Upload synthetic scene to a temporary binding on texture units 0/1.
+      gl.activeTexture(gl.TEXTURE0)
+      gl.bindTexture(gl.TEXTURE_2D, this.videoTexture)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, thumbVideo)
+      gl.activeTexture(gl.TEXTURE1)
+      gl.bindTexture(gl.TEXTURE_2D, this.maskTexture)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, thumbMask)
+    }
 
     // Render to art FBO (use it as scratch).
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.artFBO)
@@ -281,9 +396,14 @@ export class ArtRenderer {
     gl.uniform1f(gl.getUniformLocation(program, 'time'), time)
     gl.uniform1fv(gl.getUniformLocation(program, 'params'), effect.params)
     gl.uniform3fv(gl.getUniformLocation(program, 'palette'), effect.palette)
+
     gl.activeTexture(gl.TEXTURE0)
     gl.bindTexture(gl.TEXTURE_2D, this.videoTexture)
     gl.uniform1i(gl.getUniformLocation(program, 'uVideo'), 0)
+    gl.activeTexture(gl.TEXTURE1)
+    gl.bindTexture(gl.TEXTURE_2D, this.maskTexture)
+    gl.uniform1i(gl.getUniformLocation(program, 'uMask'), 1)
+
     this.drawQuad()
 
     // Read pixels into outCanvas.
@@ -293,6 +413,7 @@ export class ArtRenderer {
     // Restore previous state.
     gl.bindFramebuffer(gl.FRAMEBUFFER, prevFBO)
     gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3])
+    gl.activeTexture(prevActiveTex)
 
     // Draw pixels to the output 2D canvas (flip Y because GL is bottom-up).
     outCanvas.width = this.width
@@ -331,6 +452,7 @@ export class ArtRenderer {
     gl.deleteProgram(this.compositeProgram)
     gl.deleteBuffer(this.quadVBO)
     gl.deleteTexture(this.videoTexture)
+    gl.deleteTexture(this.maskTexture)
     gl.deleteTexture(this.artTexture)
     gl.deleteFramebuffer(this.artFBO)
   }

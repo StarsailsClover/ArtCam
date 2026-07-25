@@ -3,7 +3,7 @@ import { PALETTES } from './palettes'
 import { ALGORITHMS } from './algorithms'
 
 // Generate the full effect registry by combining each algorithm with each palette.
-// 34 algorithms × 8 palettes = 272 distinct effects (≥ 200 required).
+// 30 algorithms × 8 palettes = 240 distinct effects (≥ 200 required).
 //
 // Each variant lightly scales the first parameter by the palette index so the same
 // algorithm produces visually different density/scale per palette.
@@ -47,23 +47,21 @@ export function randomEffect(): ArtEffect {
 }
 
 export const CATEGORY_LIST: EffectCategory[] = [
-  'noise',
-  'fractal',
-  'attractor',
-  'geometric',
-  'painterly',
-  'wave',
-  'mosaic',
+  'segmentation',
+  'distort',
+  'stylize',
+  'color',
+  'feedback',
+  'glitch',
 ]
 
 export const CATEGORY_LABEL: Record<EffectCategory, string> = {
-  noise: 'Noise',
-  fractal: 'Fractal',
-  attractor: 'Attractor',
-  geometric: 'Geometric',
-  painterly: 'Painterly',
-  wave: 'Wave',
-  mosaic: 'Mosaic',
+  segmentation: 'Segment',
+  distort: 'Distort',
+  stylize: 'Stylize',
+  color: 'Color',
+  feedback: 'Feedback',
+  glitch: 'Glitch',
 }
 
 export function effectsByCategory(cat: EffectCategory): ArtEffect[] {

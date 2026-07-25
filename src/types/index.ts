@@ -22,13 +22,12 @@ export interface HandFrame {
 }
 
 export type EffectCategory =
-  | 'noise'
-  | 'fractal'
-  | 'attractor'
-  | 'geometric'
-  | 'painterly'
-  | 'wave'
-  | 'mosaic'
+  | 'segmentation'
+  | 'distort'
+  | 'stylize'
+  | 'color'
+  | 'feedback'
+  | 'glitch'
 
 export interface ArtEffect {
   id: number

@@ -259,14 +259,21 @@ void main() {
 `
 
 // Effect shader template. `%%BODY%%` is replaced with each effect's GLSL body.
-// The template intentionally does NOT pre-sample the video — algorithms must
-// derive their color from generative math (uv, time, noise, SDFs, etc.).
-// Algorithms that want to react to the live camera feed can sample uVideo
-// explicitly inside the body (e.g. for subtle brightness-driven flow).
+//
+// Effects are TRUE visual effects applied to the camera scene: they sample
+// `uVideo` (the live camera feed) and transform it. `uMask` is a person-
+// segmentation mask (1 = person, 0 = background) from MediaPipe
+// SelfieSegmentation, so effects can treat subject and background differently.
+//
+// Coordinate convention: `vUv` is rect-local 0..1 (Y up). `uRectOrigin` and
+// `uRectSize` define the rect's position in canvas 0..1 space (Y up, already
+// flipped from MediaPipe's top-down convention by the renderer). To sample
+// the video/mask at the current rect-local uv, use the helpers below.
 export const EFFECT_FRAGMENT_TEMPLATE = /* glsl */ `#version 300 es
 precision highp float;
 in vec2 vUv;
 uniform sampler2D uVideo;
+uniform sampler2D uMask;
 uniform vec2 uResolution;
 uniform vec2 uRectOrigin;
 uniform vec2 uRectSize;
@@ -276,6 +283,23 @@ uniform vec3 palette[8];
 out vec4 fragColor;
 
 ${GLSL_PREAMBLE}
+
+// Sample the camera frame at rect-local uv (0..1 within this rect).
+vec3 sampleVideo(vec2 uv) {
+  return texture(uVideo, uRectOrigin + uv * uRectSize).rgb;
+}
+// Sample the camera frame at an arbitrary canvas-space 0..1 position.
+vec3 sampleVideoCanvas(vec2 canvasUv) {
+  return texture(uVideo, canvasUv).rgb;
+}
+// Person mask at rect-local uv. Returns 1.0 for person, 0.0 for background.
+float sampleMask(vec2 uv) {
+  return texture(uMask, uRectOrigin + uv * uRectSize).r;
+}
+// Person mask at arbitrary canvas-space 0..1 position.
+float sampleMaskCanvas(vec2 canvasUv) {
+  return texture(uMask, canvasUv).r;
+}
 
 void main() {
   vec2 uv = vUv;

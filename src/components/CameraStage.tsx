@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ArtRenderer } from '@/gl/renderer'
 import { useHandTracking } from '@/hooks/useHandTracking'
+import { useSegmentation } from '@/hooks/useSegmentation'
 import { useArtStore } from '@/store/useArtStore'
 import { randomEffect, getEffect } from '@/gl/effects'
 import { randomId } from '@/lib/utils'
@@ -35,6 +36,7 @@ export default function CameraStage({ rendererRef, onFps, onPlace }: CameraStage
   const setCameraStatus = useArtStore((s) => s.setCameraStatus)
 
   const { handsRef, ready, error } = useHandTracking(videoRef.current, enabled)
+  const { maskCanvasRef, ready: segReady, error: segError } = useSegmentation(videoRef.current, enabled)
 
   // Refs to avoid restarting the rAF loop when settings change.
   const mirrorRef = useRef(mirror)
@@ -126,6 +128,8 @@ export default function CameraStage({ rendererRef, onFps, onPlace }: CameraStage
       const overlay = overlayRef.current
       if (renderer && video && overlay) {
         renderer.uploadVideoFrame(video)
+        const maskCanvas = maskCanvasRef.current
+        if (maskCanvas) renderer.uploadMaskFrame(maskCanvas)
         renderer.renderComposite(mirrorRef.current)
         const hands = handsRef.current
         drawOverlay(overlay, hands, mirrorRef.current, skeletonRef.current)
@@ -193,7 +197,7 @@ export default function CameraStage({ rendererRef, onFps, onPlace }: CameraStage
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-ink-dim">
           <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/10 border-t-accent" />
           <p className="font-mono text-xs uppercase tracking-wider">
-            Loading hand tracking model…
+            Loading hand tracking &amp; segmentation models…
           </p>
         </div>
       )}
@@ -206,6 +210,12 @@ export default function CameraStage({ rendererRef, onFps, onPlace }: CameraStage
             <br />
             请允许摄像头权限并使用支持 WebGL2 的现代浏览器。
           </p>
+        </div>
+      )}
+
+      {ready && !segReady && !segError && (
+        <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full border border-white/10 bg-black/60 px-3 py-1 font-mono text-[10px] uppercase tracking-wider text-ink-dim backdrop-blur">
+          Loading segmentation model…
         </div>
       )}
     </div>
